@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use rand::Rng;
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
@@ -32,7 +32,7 @@ pub struct UploadTarget {
     pub upload_headers: serde_json::Map<String, Value>,
 }
 
-/// A caller's Higgsfield API key. Never logged or stored.
+/// The local user's Higgsfield API key. Never logged or stored.
 #[derive(Clone)]
 pub struct Credentials {
     key_id: String,
@@ -56,28 +56,6 @@ impl Credentials {
             bail!("Higgsfield key id/secret contain invalid characters");
         }
         Ok(Self { key_id: key_id.into(), key_secret: key_secret.into() })
-    }
-
-    /// Accepts `Authorization: Key ID:SECRET` (Higgsfield's own format) or
-    /// `Authorization: Bearer ID:SECRET`, or the `X-Higgsfield-Key-Id` and
-    /// `X-Higgsfield-Key-Secret` header pair. Returns `None` when absent.
-    pub fn from_headers(headers: &http::HeaderMap) -> Result<Option<Self>> {
-        let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
-        if let (Some(id), Some(secret)) = (get("x-higgsfield-key-id"), get("x-higgsfield-key-secret")) {
-            return Self::new(id, secret).map(Some);
-        }
-        let Some(auth) = get("authorization") else {
-            return Ok(None);
-        };
-        let (scheme, value) = auth.split_once(' ').unwrap_or(("", auth));
-        if !matches!(scheme.to_ascii_lowercase().as_str(), "key" | "bearer") {
-            bail!("unsupported Authorization scheme; use `Authorization: Key <KEY_ID>:<KEY_SECRET>`");
-        }
-        let (id, secret) = value
-            .trim()
-            .split_once(':')
-            .ok_or_else(|| anyhow!("Authorization must be `Key <KEY_ID>:<KEY_SECRET>` (id and secret joined by a colon)"))?;
-        Self::new(id, secret).map(Some)
     }
 }
 
@@ -278,23 +256,13 @@ fn explain_status(status: StatusCode) -> &'static str {
 mod tests {
     use super::*;
 
-    fn headers(pairs: &[(&str, &str)]) -> http::HeaderMap {
-        let mut h = http::HeaderMap::new();
-        for (k, v) in pairs {
-            h.insert(http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
-        }
-        h
-    }
-
     #[test]
-    fn parses_caller_credentials() {
-        let c = Credentials::from_headers(&headers(&[("authorization", "Key abc:s3cr:et")])).unwrap().unwrap();
+    fn validates_credentials() {
+        let c = Credentials::new(" abc ", "s3cr:et").unwrap();
         assert_eq!((c.key_id.as_str(), c.key_secret.as_str()), ("abc", "s3cr:et"));
-        assert!(Credentials::from_headers(&headers(&[("authorization", "Bearer abc:xyz")])).unwrap().is_some());
-        assert!(Credentials::from_headers(&headers(&[("x-higgsfield-key-id", "a"), ("x-higgsfield-key-secret", "b")])).unwrap().is_some());
-        assert!(Credentials::from_headers(&headers(&[])).unwrap().is_none());
-        assert!(Credentials::from_headers(&headers(&[("authorization", "Key nocolon")])).is_err());
-        assert!(Credentials::from_headers(&headers(&[("authorization", "Basic abc:xyz")])).is_err());
+        assert!(Credentials::new("", "x").is_err());
+        assert!(Credentials::new("a:b", "x").is_err());
+        assert!(Credentials::new("a", "bad secret").is_err());
         assert_eq!(format!("{c:?}"), "Credentials(<redacted>)");
     }
 }

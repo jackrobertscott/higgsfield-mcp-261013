@@ -1,10 +1,10 @@
 //! MCP tool surface for the Higgsfield API.
 //!
-//! The server holds no Higgsfield credentials of its own. Over HTTP every
-//! request carries the caller's key; over stdio the key comes from the local
-//! environment of the user's own machine.
+//! Runs locally over stdio. The Higgsfield key comes from the environment of the
+//! user's own machine and is only ever sent to api.higgsfield.ai.
 
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -12,7 +12,7 @@ use base64::Engine;
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{Extensions, Implementation, ServerCapabilities, ServerConfig},
+    model::{Implementation, ServerCapabilities, ServerConfig},
     schemars::{self, JsonSchema},
     tool, tool_handler, tool_router,
 };
@@ -23,26 +23,27 @@ use crate::catalog::{Catalog, validate_endpoint};
 use crate::higgsfield::{Credentials, HiggsfieldClient, is_terminal};
 
 const MAX_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
+const MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 const INSTRUCTIONS: &str = "\
-Higgsfield pay-as-you-go API: image and video generation billed to the caller's own Higgsfield API balance in real US dollars (not subscription credits).
+Higgsfield pay-as-you-go API: image and video generation billed to the user's own Higgsfield API balance in real US dollars (not subscription credits).
 
 Workflow:
 1. list_models to find a model workflow and its `endpoint` and `doc_path`.
 2. get_model_docs(doc_path) to read the exact input schema. Parameters differ per model; never guess them.
-3. If the user supplies local or private media, upload_file first and use the returned public_url in params (image_url, video_url, ...).
+3. If the user supplies local or private media, upload_file first (file_path works for files on this computer) and use the returned public_url in params (image_url, video_url, ...).
 4. estimate_cost(endpoint, params) returns the USD price without spending anything.
 5. generate(endpoint, params) submits the job and is billed.
-6. Generation is asynchronous. Use wait_for_request (or generate with wait_seconds) and return the output URLs. Outputs expire after ~7 days.
+6. Generation is asynchronous. Use wait_for_request (or generate with wait_seconds) and return the output URLs. Outputs expire after ~7 days, so use download_output to save them to this computer.
 Failed, nsfw and canceled requests are refunded. Only queued requests can be canceled.";
 
-const MISSING_CREDENTIALS: &str = "No Higgsfield API key was sent. Create a key at https://cloud.higgsfield.ai and configure your MCP client to send the header `Authorization: Key <KEY_ID>:<KEY_SECRET>` (see the project README).";
+const MISSING_CREDENTIALS: &str = "No Higgsfield API key is configured. Create a key at https://cloud.higgsfield.ai, set HF_API_KEY_ID and HF_API_KEY_SECRET in the environment this MCP server is launched with, and restart it (see the project README).";
 
 #[derive(Clone)]
 pub struct HiggsfieldMcp {
     http: reqwest::Client,
-    /// Only set in stdio mode, from the local environment.
-    local_credentials: Option<Credentials>,
+    /// `None` when no key is configured; only the free catalog tools work then.
+    client: Option<HiggsfieldClient>,
     catalog: Catalog,
     tool_router: ToolRouter<Self>,
 }
@@ -101,12 +102,24 @@ pub struct WaitArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct UploadArgs {
-    /// Public https URL the server downloads and re-uploads to Higgsfield storage.
+    /// Path to a file on this computer. `~` expands to the home directory.
+    pub file_path: Option<String>,
+    /// Public https URL to download and re-upload to Higgsfield storage.
     pub source_url: Option<String>,
     /// Base64-encoded file contents (alternative to source_url). A data: URI prefix is accepted.
     pub base64_data: Option<String>,
     /// MIME type: image/jpeg, image/png, image/webp, image/gif, audio/wav, audio/x-wav or video/mp4. Inferred when omitted.
     pub content_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DownloadArgs {
+    /// Output URL from get_request_status or wait_for_request.
+    pub url: String,
+    /// Directory to save into. Defaults to HF_OUTPUT_DIR, or ~/Downloads/higgsfield.
+    pub dir: Option<String>,
+    /// File name to save as. Defaults to the last segment of the URL; never overwrites an existing file.
+    pub filename: Option<String>,
 }
 
 const ALLOWED_UPLOAD_TYPES: [&str; 8] = [
@@ -172,23 +185,18 @@ fn summarize(status: Value) -> Value {
 }
 
 impl HiggsfieldMcp {
-    /// Builds a client for whoever is calling: their HTTP headers, or the local env in stdio mode.
-    fn client_for(&self, ext: &Extensions) -> Result<HiggsfieldClient, String> {
-        let creds = match ext.get::<http::request::Parts>() {
-            Some(parts) => Credentials::from_headers(&parts.headers).map_err(err)?,
-            None => self.local_credentials.clone(),
-        };
-        let creds = creds.ok_or_else(|| MISSING_CREDENTIALS.to_string())?;
-        Ok(HiggsfieldClient::new(self.http.clone(), creds))
+    fn client(&self) -> Result<&HiggsfieldClient, String> {
+        self.client.as_ref().ok_or_else(|| MISSING_CREDENTIALS.to_string())
     }
 }
 
 #[tool_router]
 impl HiggsfieldMcp {
-    pub fn new(local_credentials: Option<Credentials>) -> Self {
+    pub fn new(credentials: Option<Credentials>) -> Self {
+        let http = crate::higgsfield::http_client();
         Self {
-            http: crate::higgsfield::http_client(),
-            local_credentials,
+            client: credentials.map(|c| HiggsfieldClient::new(http.clone(), c)),
+            http,
             catalog: Catalog::default(),
             tool_router: Self::tool_router(),
         }
@@ -232,10 +240,9 @@ impl HiggsfieldMcp {
     )]
     async fn estimate_cost(
         &self,
-        ext: Extensions,
         Parameters(args): Parameters<EstimateArgs>,
     ) -> Result<String, String> {
-        let client = self.client_for(&ext)?;
+        let client = self.client()?;
         let endpoint = validate_endpoint(&args.endpoint).map_err(err)?;
         let est = client
             .estimate(&endpoint, &Value::Object(args.params))
@@ -245,15 +252,14 @@ impl HiggsfieldMcp {
     }
 
     #[tool(
-        description = "Submit a generation to the Higgsfield API, billed to the caller's API balance. Returns request_id and, if wait_seconds > 0 and it finished, the output URLs.",
+        description = "Submit a generation to the Higgsfield API, billed to the user's API balance. Returns request_id and, if wait_seconds > 0 and it finished, the output URLs.",
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
     )]
     async fn generate(
         &self,
-        ext: Extensions,
         Parameters(args): Parameters<GenerateArgs>,
     ) -> Result<String, String> {
-        let client = self.client_for(&ext)?;
+        let client = self.client()?;
         let endpoint = validate_endpoint(&args.endpoint).map_err(err)?;
         let params = Value::Object(args.params);
         let key = match args.idempotency_key {
@@ -301,10 +307,9 @@ impl HiggsfieldMcp {
     )]
     async fn get_request_status(
         &self,
-        ext: Extensions,
         Parameters(args): Parameters<RequestIdArgs>,
     ) -> Result<String, String> {
-        let client = self.client_for(&ext)?;
+        let client = self.client()?;
         let id = validate_request_id(&args.request_id).map_err(err)?;
         let status = client.status(id).await.map_err(err)?;
         to_json(summarize(status))
@@ -316,10 +321,9 @@ impl HiggsfieldMcp {
     )]
     async fn wait_for_request(
         &self,
-        ext: Extensions,
         Parameters(args): Parameters<WaitArgs>,
     ) -> Result<String, String> {
-        let client = self.client_for(&ext)?;
+        let client = self.client()?;
         let id = validate_request_id(&args.request_id).map_err(err)?;
         let timeout = Duration::from_secs(args.timeout_seconds.unwrap_or(120).clamp(1, 600));
         let status = client.wait(id, timeout).await.map_err(err)?;
@@ -332,29 +336,28 @@ impl HiggsfieldMcp {
     )]
     async fn cancel_request(
         &self,
-        ext: Extensions,
         Parameters(args): Parameters<RequestIdArgs>,
     ) -> Result<String, String> {
-        let client = self.client_for(&ext)?;
+        let client = self.client()?;
         let id = validate_request_id(&args.request_id).map_err(err)?;
         client.cancel(id).await.map_err(err)?;
         to_json(json!({ "request_id": id, "canceled": true }))
     }
 
     #[tool(
-        description = "Upload input media (image, audio or video) to Higgsfield storage and get a public_url to pass in generation params such as image_url. Provide source_url (public https) or base64_data. Free.",
+        description = "Upload input media (image, audio or video) to Higgsfield storage and get a public_url to pass in generation params such as image_url. Provide file_path (a file on this computer), source_url (public https) or base64_data. Free.",
         annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true)
     )]
     async fn upload_file(
         &self,
-        ext: Extensions,
         Parameters(args): Parameters<UploadArgs>,
     ) -> Result<String, String> {
-        let client = self.client_for(&ext)?;
-        let (bytes, detected) = match (args.source_url, args.base64_data) {
-            (Some(url), None) => download_public(&url).await.map_err(err)?,
-            (None, Some(data)) => decode_base64(&data).map_err(err)?,
-            _ => return Err("provide exactly one of source_url or base64_data".into()),
+        let client = self.client()?;
+        let (bytes, detected) = match (args.file_path, args.source_url, args.base64_data) {
+            (Some(path), None, None) => read_local(&path).await.map_err(err)?,
+            (None, Some(url), None) => download_public(&url).await.map_err(err)?,
+            (None, None, Some(data)) => decode_base64(&data).map_err(err)?,
+            _ => return Err("provide exactly one of file_path, source_url or base64_data".into()),
         };
         let content_type = args
             .content_type
@@ -373,6 +376,21 @@ impl HiggsfieldMcp {
         client.put_presigned(&target, bytes).await.map_err(err)?;
         to_json(json!({ "public_url": target.public_url, "content_type": content_type, "bytes": size }))
     }
+
+    #[tool(
+        description = "Save a generated output (image, video or audio URL) to a file on this computer and return its local path. Higgsfield output URLs expire after ~7 days. Free.",
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
+    )]
+    async fn download_output(&self, Parameters(args): Parameters<DownloadArgs>) -> Result<String, String> {
+        let dir = match args.dir {
+            Some(d) => expand_home(&d),
+            None => default_output_dir().map_err(err)?,
+        };
+        let (path, bytes) = download_to(&self.http, &args.url, &dir, args.filename.as_deref())
+            .await
+            .map_err(err)?;
+        to_json(json!({ "path": path, "bytes": bytes }))
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -383,6 +401,128 @@ impl ServerHandler for HiggsfieldMcp {
                 Implementation::new("higgsfield-mcp", env!("CARGO_PKG_VERSION")).with_title("Higgsfield API"),
             )
             .with_instructions(INSTRUCTIONS)
+    }
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    let path = path.trim();
+    match (path.strip_prefix("~"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
+            PathBuf::from(home).join(rest.trim_start_matches('/'))
+        }
+        _ => PathBuf::from(path),
+    }
+}
+
+fn default_output_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var("HF_OUTPUT_DIR").ok().filter(|d| !d.trim().is_empty()) {
+        return Ok(expand_home(&dir));
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set; pass dir explicitly"))?;
+    Ok(PathBuf::from(home).join("Downloads").join("higgsfield"))
+}
+
+async fn read_local(path: &str) -> Result<(Vec<u8>, Option<String>)> {
+    let path = expand_home(path);
+    let meta = tokio::fs::metadata(&path)
+        .await
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    if !meta.is_file() {
+        bail!("{} is not a file", path.display());
+    }
+    if meta.len() as usize > MAX_UPLOAD_BYTES {
+        bail!("file exceeds {} MB", MAX_UPLOAD_BYTES / 1024 / 1024);
+    }
+    let bytes = tokio::fs::read(&path)
+        .await
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    Ok((bytes, None))
+}
+
+/// Keeps only a safe file name: no directories, no leading dots.
+fn sanitize_filename(name: &str) -> Option<String> {
+    let name = name.rsplit(['/', '\\']).next()?.trim();
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
+    let cleaned = cleaned.trim_start_matches('.').to_string();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// Picks `name`, or `stem-1.ext`, `stem-2.ext`, ... so existing files are never overwritten.
+fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
+        _ => (name, String::new()),
+    };
+    (1..)
+        .map(|i| dir.join(format!("{stem}-{i}{ext}")))
+        .find(|p| !p.exists())
+        .expect("unbounded search finds a free name")
+}
+
+async fn download_to(http: &reqwest::Client, raw: &str, dir: &Path, filename: Option<&str>) -> Result<(PathBuf, u64)> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let url = url::Url::parse(raw.trim()).context("invalid url")?;
+    if url.scheme() != "https" {
+        bail!("url must be https");
+    }
+    let name = filename
+        .or_else(|| url.path_segments().and_then(|mut s| s.next_back()))
+        .and_then(sanitize_filename)
+        .unwrap_or_else(|| format!("higgsfield-{}", uuid::Uuid::new_v4()));
+
+    // The shared client has a 60s total timeout, too short for large videos.
+    let resp = http
+        .get(url)
+        .timeout(Duration::from_secs(600))
+        .send()
+        .await
+        .context("download failed")?;
+    if !resp.status().is_success() {
+        bail!("download returned {}", resp.status());
+    }
+    if resp.content_length().is_some_and(|l| l > MAX_DOWNLOAD_BYTES) {
+        bail!("file exceeds {} GB", MAX_DOWNLOAD_BYTES / 1024 / 1024 / 1024);
+    }
+
+    tokio::fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("cannot create {}", dir.display()))?;
+    let path = unique_path(dir, &name);
+    let tmp = path.with_file_name(format!(".{name}.{}.part", uuid::Uuid::new_v4()));
+    let result = async {
+        let mut file = tokio::fs::File::create_new(&tmp).await?;
+        let mut written = 0u64;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            written += chunk.len() as u64;
+            if written > MAX_DOWNLOAD_BYTES {
+                bail!("file exceeds {} GB", MAX_DOWNLOAD_BYTES / 1024 / 1024 / 1024);
+            }
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        Ok(written)
+    }
+    .await;
+    match result {
+        Ok(written) => {
+            tokio::fs::rename(&tmp, &path).await?;
+            Ok((path, written))
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            Err(e)
+        }
     }
 }
 
@@ -517,6 +657,25 @@ mod tests {
             assert!(!is_public_ip(ip.parse().unwrap()), "{ip}");
         }
         assert!(is_public_ip("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn sanitizes_filenames() {
+        assert_eq!(sanitize_filename("clip.mp4").as_deref(), Some("clip.mp4"));
+        assert_eq!(sanitize_filename("../../etc/passwd").as_deref(), Some("passwd"));
+        assert_eq!(sanitize_filename("..").as_deref(), None);
+        assert_eq!(sanitize_filename("a b?.png").as_deref(), Some("a_b_.png"));
+    }
+
+    #[test]
+    fn never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("hf-mcp-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.png"), b"x").unwrap();
+        std::fs::write(dir.join("a-1.png"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, "a.png"), dir.join("a-2.png"));
+        assert_eq!(unique_path(&dir, "b.png"), dir.join("b.png"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

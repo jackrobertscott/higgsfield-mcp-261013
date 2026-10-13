@@ -8,19 +8,16 @@ repository = "https://github.com/jackrobertscott/higgsfield-mcp-261013"
 
 [dependencies]
 anyhow = "1"
-axum = "0.8"
 base64 = "0.22"
 futures = "0.3"
-http = "1"
 rand = "0.9"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-rmcp = { version = "3.5", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "3.5", features = ["server", "macros", "transport-io"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
