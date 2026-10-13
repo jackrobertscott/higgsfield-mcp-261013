@@ -40,8 +40,14 @@ fn env_bool(name: &str) -> bool {
 }
 
 fn build_server() -> Result<HiggsfieldMcp> {
-    let key_id = env_opt("HF_API_KEY_ID").context("HF_API_KEY_ID is not set (create one at https://cloud.higgsfield.ai)")?;
-    let key_secret = env_opt("HF_API_KEY_SECRET").context("HF_API_KEY_SECRET is not set")?;
+    // Start without credentials so the deploy stays healthy; tools then report a 401.
+    let (key_id, key_secret) = match (env_opt("HF_API_KEY_ID"), env_opt("HF_API_KEY_SECRET")) {
+        (Some(id), Some(secret)) => (id, secret),
+        _ => {
+            tracing::warn!("HF_API_KEY_ID / HF_API_KEY_SECRET not set; create a key at https://cloud.higgsfield.ai");
+            (String::new(), String::new())
+        }
+    };
     let per_request = env_f64("HF_MAX_USD_PER_REQUEST")?.unwrap_or(5.0);
     let per_day = env_f64("HF_MAX_USD_PER_DAY")?;
     if per_request <= 0.0 || per_day.is_some_and(|d| d <= 0.0) {
