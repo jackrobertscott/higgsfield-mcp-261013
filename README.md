@@ -15,83 +15,104 @@ models appear without a redeploy.
 | `list_models` | free | Model families and workflows, with `endpoint` and `doc_path` |
 | `get_model_docs` | free | Input schema, allowed values and output shape for a workflow |
 | `estimate_cost` | free | USD and credit estimate for an endpoint and params |
-| `generate` | **paid** | Estimates, checks the spend caps, then submits. Needs `max_usd` |
+| `generate` | **paid** | Submits a generation, billed to your API balance |
 | `get_request_status` / `wait_for_request` | free | Poll a request and return output URLs |
 | `cancel_request` | refund | Cancel a request that is still queued |
 | `upload_file` | free | Upload media from a public https URL or base64 and get a `public_url` |
-| `get_spend_limits` | free | Show the caps and today's estimated spend |
 
-## Spending safeguards
+## Public server, your own key
 
-- `generate` always calls the estimate endpoint first and refuses when the estimate is above
-  the caller's `max_usd`, `HF_MAX_USD_PER_REQUEST`, or the remaining `HF_MAX_USD_PER_DAY` budget.
-- If a cost can't be estimated, nothing is submitted (unless `HF_ALLOW_UNESTIMATED=true`).
-- Every submission sends an `Idempotency-Key`, so a retry after a network failure is not charged twice.
-- The daily total lives in memory and resets when the server restarts. Your real balance is on
-  [cloud.higgsfield.ai](https://cloud.higgsfield.ai).
+The hosted server is public and holds no Higgsfield credentials. Each client sends its own key
+with every request, read from the machine it runs on:
 
-## Configuration
-
-| Variable | Required | Default | Notes |
-| - | - | - | - |
-| `HF_API_KEY_ID` | yes | | From cloud.higgsfield.ai |
-| `HF_API_KEY_SECRET` | yes | | |
-| `MCP_AUTH_TOKEN` | HTTP mode | | 24+ characters. Clients send it as a Bearer token or in the path `/mcp/<token>` |
-| `HF_MAX_USD_PER_REQUEST` | no | `5` | |
-| `HF_MAX_USD_PER_DAY` | no | unlimited | |
-| `HF_ALLOW_UNESTIMATED` | no | `false` | |
-| `MCP_ALLOWED_HOSTS` | no | any | Comma-separated `Host` allowlist |
-| `PORT` | no | | When set, the server runs in HTTP mode; otherwise it uses stdio |
-
-## Deployment (Railway)
-
-The Railway project `higgsfield-mcp-261013` builds from this repo's `Dockerfile` and redeploys on
-every push to `master`. The MCP endpoint is `https://<domain>/mcp`.
-
-```bash
-railway variables --service higgsfield-mcp --set "HF_API_KEY_ID=..." --set "HF_API_KEY_SECRET=..."
 ```
+Authorization: Key <KEY_ID>:<KEY_SECRET>
+```
+
+This is the same header format Higgsfield uses. The server also accepts `Bearer <KEY_ID>:<KEY_SECRET>`,
+or the `X-Higgsfield-Key-Id` and `X-Higgsfield-Key-Secret` header pair. The server forwards the key to
+`api.higgsfield.ai` for that one call and never stores or logs it. Every call bills the caller's own
+Higgsfield account, and the server sets no spending limits.
+
+If you don't want your key to pass through any server you don't run, use [local stdio mode](#local-stdio-mode).
+
+Public endpoint: `https://higgsfield-mcp-production-4c73.up.railway.app/mcp`
 
 ## Connecting
 
-Read the token without printing it into your shell history:
+Create an API key at [cloud.higgsfield.ai](https://cloud.higgsfield.ai) and export it in your shell
+profile on your own computer:
 
 ```bash
-TOKEN=$(railway variables --service higgsfield-mcp --kv | grep '^MCP_AUTH_TOKEN=' | cut -d= -f2-)
+export HF_API_KEY_ID="..."
+export HF_API_KEY_SECRET="..."
 ```
 
-**Claude Code**
+### Claude Code
 
 ```bash
-claude mcp add --scope user --transport http higgsfield https://higgsfield-mcp-production-4c73.up.railway.app/mcp --header "Authorization: Bearer $TOKEN"
+claude mcp add --scope user --transport http higgsfield https://higgsfield-mcp-production-4c73.up.railway.app/mcp --header "Authorization: Key ${HF_API_KEY_ID}:${HF_API_KEY_SECRET}"
 ```
 
-**Claude Desktop / claude.ai**: Settings → Connectors → Add custom connector, and use this URL
-(the token goes in the path because custom connectors can't send headers):
+### Claude Desktop
 
-```
-https://higgsfield-mcp-production-4c73.up.railway.app/mcp/<MCP_AUTH_TOKEN>
-```
-
-Treat that URL as a secret. To revoke access, change `MCP_AUTH_TOKEN` in Railway.
-
-**Local stdio** (no Railway needed):
+Custom connectors in Claude Desktop can't send headers, so use the `mcp-remote` bridge. It runs on
+your computer and adds the header for you. In `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "higgsfield": {
-      "command": "/path/to/higgsfield-mcp",
-      "args": ["--stdio"],
-      "env": { "HF_API_KEY_ID": "...", "HF_API_KEY_SECRET": "...", "HF_MAX_USD_PER_REQUEST": "5" }
+      "command": "npx",
+      "args": [
+        "-y", "mcp-remote",
+        "https://higgsfield-mcp-production-4c73.up.railway.app/mcp",
+        "--header", "Authorization:${HF_AUTH}"
+      ],
+      "env": { "HF_AUTH": "Key YOUR_KEY_ID:YOUR_KEY_SECRET" }
     }
   }
 }
 ```
 
+### Local stdio mode
+
+Run the binary on your own machine so your key never leaves it except to reach Higgsfield:
+
+```bash
+cargo install --git https://github.com/jackrobertscott/higgsfield-mcp-261013
+```
+
+```json
+{
+  "mcpServers": {
+    "higgsfield": {
+      "command": "higgsfield-mcp",
+      "args": ["--stdio"],
+      "env": { "HF_API_KEY_ID": "...", "HF_API_KEY_SECRET": "..." }
+    }
+  }
+}
+```
+
+For Claude Code: `claude mcp add --scope user higgsfield -e HF_API_KEY_ID=$HF_API_KEY_ID -e HF_API_KEY_SECRET=$HF_API_KEY_SECRET -- higgsfield-mcp --stdio`
+
+## Server configuration
+
+| Variable | Default | Notes |
+| - | - | - |
+| `PORT` | | When set, the server runs in public HTTP mode; otherwise it uses stdio |
+| `MCP_ALLOWED_HOSTS` | any | Optional comma-separated `Host` allowlist |
+| `HF_API_KEY_ID` / `HF_API_KEY_SECRET` | | **stdio mode only.** Ignored in HTTP mode |
+
+## Deployment (Railway)
+
+The Railway project `higgsfield-mcp-261013` builds from this repo's `Dockerfile` and redeploys on
+every push to `master`. Don't set Higgsfield keys on the server.
+
 ## Development
 
 ```bash
 cargo test
-HF_API_KEY_ID=... HF_API_KEY_SECRET=... MCP_AUTH_TOKEN=$(openssl rand -hex 32) PORT=8080 cargo run
+PORT=8080 cargo run
 ```

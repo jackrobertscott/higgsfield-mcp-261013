@@ -1,107 +1,49 @@
 //! MCP tool surface for the Higgsfield API.
+//!
+//! The server holds no Higgsfield credentials of its own. Over HTTP every
+//! request carries the caller's key; over stdio the key comes from the local
+//! environment of the user's own machine.
 
 use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{Implementation, ServerCapabilities, ServerConfig},
+    model::{Extensions, Implementation, ServerCapabilities, ServerConfig},
     schemars::{self, JsonSchema},
     tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use tokio::sync::Mutex;
 
 use crate::catalog::{Catalog, validate_endpoint};
-use crate::higgsfield::{HiggsfieldClient, is_terminal};
+use crate::higgsfield::{Credentials, HiggsfieldClient, is_terminal};
 
 const MAX_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
 
 const INSTRUCTIONS: &str = "\
-Higgsfield pay-as-you-go API: image and video generation billed in real US dollars (not subscription credits).
+Higgsfield pay-as-you-go API: image and video generation billed to the caller's own Higgsfield API balance in real US dollars (not subscription credits).
 
 Workflow:
 1. list_models to find a model workflow and its `endpoint` and `doc_path`.
 2. get_model_docs(doc_path) to read the exact input schema. Parameters differ per model; never guess them.
 3. If the user supplies local or private media, upload_file first and use the returned public_url in params (image_url, video_url, ...).
-4. estimate_cost(endpoint, params) and tell the user the USD price before spending. Get the user's go-ahead unless they already approved a budget.
-5. generate(endpoint, params, max_usd) - max_usd must be >= the estimate. The server also enforces its own per-request and daily caps.
+4. estimate_cost(endpoint, params) returns the USD price without spending anything.
+5. generate(endpoint, params) submits the job and is billed.
 6. Generation is asynchronous. Use wait_for_request (or generate with wait_seconds) and return the output URLs. Outputs expire after ~7 days.
 Failed, nsfw and canceled requests are refunded. Only queued requests can be canceled.";
 
-#[derive(Clone)]
-pub struct SpendGuard {
-    pub max_usd_per_request: f64,
-    pub max_usd_per_day: Option<f64>,
-    spent: Arc<Mutex<(u64, f64)>>,
-}
-
-impl SpendGuard {
-    pub fn new(max_usd_per_request: f64, max_usd_per_day: Option<f64>) -> Self {
-        Self {
-            max_usd_per_request,
-            max_usd_per_day,
-            spent: Arc::new(Mutex::new((today(), 0.0))),
-        }
-    }
-
-    async fn spent_today(&self) -> f64 {
-        let mut s = self.spent.lock().await;
-        if s.0 != today() {
-            *s = (today(), 0.0);
-        }
-        s.1
-    }
-
-    /// Checks the caps and reserves `usd` against today's budget.
-    async fn reserve(&self, usd: f64, caller_max: f64) -> Result<()> {
-        if usd > caller_max + 1e-9 {
-            bail!("estimated cost ${usd:.3} exceeds max_usd ${caller_max:.3}; ask the user to approve a higher budget");
-        }
-        if usd > self.max_usd_per_request + 1e-9 {
-            bail!(
-                "estimated cost ${usd:.3} exceeds this server's per-request cap ${:.2} (HF_MAX_USD_PER_REQUEST)",
-                self.max_usd_per_request
-            );
-        }
-        let mut s = self.spent.lock().await;
-        if s.0 != today() {
-            *s = (today(), 0.0);
-        }
-        if let Some(day_cap) = self.max_usd_per_day {
-            if s.1 + usd > day_cap + 1e-9 {
-                bail!(
-                    "this would bring today's spend to ${:.3}, over the daily cap ${day_cap:.2} (HF_MAX_USD_PER_DAY). Spent so far today (UTC, since last restart): ${:.3}",
-                    s.1 + usd,
-                    s.1
-                );
-            }
-        }
-        s.1 += usd;
-        Ok(())
-    }
-
-    async fn release(&self, usd: f64) {
-        let mut s = self.spent.lock().await;
-        s.1 = (s.1 - usd).max(0.0);
-    }
-}
-
-fn today() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() / 86_400
-}
+const MISSING_CREDENTIALS: &str = "No Higgsfield API key was sent. Create a key at https://cloud.higgsfield.ai and configure your MCP client to send the header `Authorization: Key <KEY_ID>:<KEY_SECRET>` (see the project README).";
 
 #[derive(Clone)]
 pub struct HiggsfieldMcp {
-    client: HiggsfieldClient,
+    http: reqwest::Client,
+    /// Only set in stdio mode, from the local environment.
+    local_credentials: Option<Credentials>,
     catalog: Catalog,
-    guard: SpendGuard,
-    allow_unestimated: bool,
     tool_router: ToolRouter<Self>,
 }
 
@@ -136,8 +78,6 @@ pub struct GenerateArgs {
     pub endpoint: String,
     /// Model input parameters exactly as documented by get_model_docs.
     pub params: Map<String, Value>,
-    /// Maximum USD the user approved for this single generation. The request is refused if the estimate is higher.
-    pub max_usd: f64,
     /// Optional idempotency key. Reuse the same key (with identical endpoint and params) only to retry a submission whose result was lost; a new key is generated otherwise.
     pub idempotency_key: Option<String>,
     /// Seconds to wait for the result before returning (0-300, default 0). Use wait_for_request for longer jobs.
@@ -231,14 +171,25 @@ fn summarize(status: Value) -> Value {
     v
 }
 
+impl HiggsfieldMcp {
+    /// Builds a client for whoever is calling: their HTTP headers, or the local env in stdio mode.
+    fn client_for(&self, ext: &Extensions) -> Result<HiggsfieldClient, String> {
+        let creds = match ext.get::<http::request::Parts>() {
+            Some(parts) => Credentials::from_headers(&parts.headers).map_err(err)?,
+            None => self.local_credentials.clone(),
+        };
+        let creds = creds.ok_or_else(|| MISSING_CREDENTIALS.to_string())?;
+        Ok(HiggsfieldClient::new(self.http.clone(), creds))
+    }
+}
+
 #[tool_router]
 impl HiggsfieldMcp {
-    pub fn new(client: HiggsfieldClient, guard: SpendGuard, allow_unestimated: bool) -> Self {
+    pub fn new(local_credentials: Option<Credentials>) -> Self {
         Self {
-            client,
+            http: crate::higgsfield::http_client(),
+            local_credentials,
             catalog: Catalog::default(),
-            guard,
-            allow_unestimated,
             tool_router: Self::tool_router(),
         }
     }
@@ -276,54 +227,39 @@ impl HiggsfieldMcp {
     }
 
     #[tool(
-        description = "Estimate the USD and credit cost of a generation without running it. Free. Always do this and tell the user the price before calling generate.",
+        description = "Estimate the USD and credit cost of a generation without running it. Free.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
-    async fn estimate_cost(&self, Parameters(args): Parameters<EstimateArgs>) -> Result<String, String> {
+    async fn estimate_cost(
+        &self,
+        ext: Extensions,
+        Parameters(args): Parameters<EstimateArgs>,
+    ) -> Result<String, String> {
+        let client = self.client_for(&ext)?;
         let endpoint = validate_endpoint(&args.endpoint).map_err(err)?;
-        let est = self
-            .client
+        let est = client
             .estimate(&endpoint, &Value::Object(args.params))
             .await
             .map_err(err)?;
-        to_json(json!({
-            "endpoint": endpoint,
-            "usd": est.usd,
-            "credits": est.credits,
-            "server_max_usd_per_request": self.guard.max_usd_per_request,
-        }))
+        to_json(json!({ "endpoint": endpoint, "usd": est.usd, "credits": est.credits }))
     }
 
     #[tool(
-        description = "SPENDS REAL MONEY. Submit a generation to the Higgsfield API. Estimates the cost first and refuses if it exceeds max_usd or the server caps. Returns request_id and, if wait_seconds > 0 and it finished, the output URLs.",
+        description = "Submit a generation to the Higgsfield API, billed to the caller's API balance. Returns request_id and, if wait_seconds > 0 and it finished, the output URLs.",
         annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
     )]
-    async fn generate(&self, Parameters(args): Parameters<GenerateArgs>) -> Result<String, String> {
+    async fn generate(
+        &self,
+        ext: Extensions,
+        Parameters(args): Parameters<GenerateArgs>,
+    ) -> Result<String, String> {
+        let client = self.client_for(&ext)?;
         let endpoint = validate_endpoint(&args.endpoint).map_err(err)?;
-        if !(args.max_usd.is_finite() && args.max_usd > 0.0) {
-            return Err("max_usd must be a positive number".into());
-        }
         let params = Value::Object(args.params);
-        let estimate = match self.client.estimate(&endpoint, &params).await {
-            Ok(e) => Some(e.usd_f64().map_err(err)?),
-            Err(e) if self.allow_unestimated => {
-                tracing::warn!("estimate failed, proceeding because HF_ALLOW_UNESTIMATED is set: {e:#}");
-                None
-            }
-            Err(e) => {
-                return Err(format!(
-                    "could not estimate cost, so nothing was submitted: {e:#}. Fix the params (see get_model_docs) and retry."
-                ));
-            }
-        };
-        let reserved = estimate.unwrap_or(0.0);
-        self.guard.reserve(reserved, args.max_usd).await.map_err(err)?;
-
         let key = match args.idempotency_key {
             Some(k) => {
                 let k = k.trim().to_string();
                 if k.is_empty() || k.len() > 255 || !k.chars().all(|c| c.is_ascii_graphic()) {
-                    self.guard.release(reserved).await;
                     return Err("idempotency_key must be 1-255 visible ASCII characters".into());
                 }
                 k
@@ -331,15 +267,11 @@ impl HiggsfieldMcp {
             None => uuid::Uuid::new_v4().to_string(),
         };
 
-        let accepted = match self.client.submit(&endpoint, &params, &key).await {
-            Ok(a) => a,
-            Err(e) => {
-                self.guard.release(reserved).await;
-                return Err(format!(
-                    "{e:#}\nIf this was a network error the request may still have been accepted; retry with idempotency_key {key:?} and identical params to avoid paying twice."
-                ));
-            }
-        };
+        let accepted = client.submit(&endpoint, &params, &key).await.map_err(|e| {
+            format!(
+                "{e:#}\nIf this was a network error the request may still have been accepted; retry with idempotency_key {key:?} and identical params to avoid paying twice."
+            )
+        })?;
         let request_id = accepted
             .get("request_id")
             .and_then(Value::as_str)
@@ -349,20 +281,12 @@ impl HiggsfieldMcp {
         let mut result = json!({
             "request_id": request_id,
             "idempotency_key": key,
-            "estimated_usd": estimate,
             "status": accepted.get("status"),
         });
         if args.wait_seconds > 0 {
             let wait = Duration::from_secs(args.wait_seconds.min(300));
-            match self.client.wait(&request_id, wait).await {
-                Ok(status) => {
-                    if let Some(s) = status.get("status").and_then(Value::as_str) {
-                        if matches!(s, "failed" | "nsfw" | "canceled") {
-                            self.guard.release(reserved).await;
-                        }
-                    }
-                    result["result"] = summarize(status);
-                }
+            match client.wait(&request_id, wait).await {
+                Ok(status) => result["result"] = summarize(status),
                 Err(e) => result["wait_error"] = json!(format!("{e:#}")),
             }
         } else {
@@ -375,9 +299,14 @@ impl HiggsfieldMcp {
         description = "Get the current status (and output URLs, if completed) of a Higgsfield request. Free.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
-    async fn get_request_status(&self, Parameters(args): Parameters<RequestIdArgs>) -> Result<String, String> {
+    async fn get_request_status(
+        &self,
+        ext: Extensions,
+        Parameters(args): Parameters<RequestIdArgs>,
+    ) -> Result<String, String> {
+        let client = self.client_for(&ext)?;
         let id = validate_request_id(&args.request_id).map_err(err)?;
-        let status = self.client.status(id).await.map_err(err)?;
+        let status = client.status(id).await.map_err(err)?;
         to_json(summarize(status))
     }
 
@@ -385,10 +314,15 @@ impl HiggsfieldMcp {
         description = "Wait for a Higgsfield request to finish (polling with backoff) and return its output URLs. Returns early with the latest status if the timeout passes; call again to keep waiting. Free.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
-    async fn wait_for_request(&self, Parameters(args): Parameters<WaitArgs>) -> Result<String, String> {
+    async fn wait_for_request(
+        &self,
+        ext: Extensions,
+        Parameters(args): Parameters<WaitArgs>,
+    ) -> Result<String, String> {
+        let client = self.client_for(&ext)?;
         let id = validate_request_id(&args.request_id).map_err(err)?;
         let timeout = Duration::from_secs(args.timeout_seconds.unwrap_or(120).clamp(1, 600));
-        let status = self.client.wait(id, timeout).await.map_err(err)?;
+        let status = client.wait(id, timeout).await.map_err(err)?;
         to_json(summarize(status))
     }
 
@@ -396,9 +330,14 @@ impl HiggsfieldMcp {
         description = "Cancel a Higgsfield request that is still queued (refunded). Requests already in progress cannot be canceled.",
         annotations(read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
-    async fn cancel_request(&self, Parameters(args): Parameters<RequestIdArgs>) -> Result<String, String> {
+    async fn cancel_request(
+        &self,
+        ext: Extensions,
+        Parameters(args): Parameters<RequestIdArgs>,
+    ) -> Result<String, String> {
+        let client = self.client_for(&ext)?;
         let id = validate_request_id(&args.request_id).map_err(err)?;
-        self.client.cancel(id).await.map_err(err)?;
+        client.cancel(id).await.map_err(err)?;
         to_json(json!({ "request_id": id, "canceled": true }))
     }
 
@@ -406,7 +345,12 @@ impl HiggsfieldMcp {
         description = "Upload input media (image, audio or video) to Higgsfield storage and get a public_url to pass in generation params such as image_url. Provide source_url (public https) or base64_data. Free.",
         annotations(read_only_hint = false, destructive_hint = false, open_world_hint = true)
     )]
-    async fn upload_file(&self, Parameters(args): Parameters<UploadArgs>) -> Result<String, String> {
+    async fn upload_file(
+        &self,
+        ext: Extensions,
+        Parameters(args): Parameters<UploadArgs>,
+    ) -> Result<String, String> {
+        let client = self.client_for(&ext)?;
         let (bytes, detected) = match (args.source_url, args.base64_data) {
             (Some(url), None) => download_public(&url).await.map_err(err)?,
             (None, Some(data)) => decode_base64(&data).map_err(err)?,
@@ -425,23 +369,9 @@ impl HiggsfieldMcp {
             ));
         }
         let size = bytes.len();
-        let target = self.client.create_upload(&content_type).await.map_err(err)?;
-        self.client.put_presigned(&target, bytes).await.map_err(err)?;
+        let target = client.create_upload(&content_type).await.map_err(err)?;
+        client.put_presigned(&target, bytes).await.map_err(err)?;
         to_json(json!({ "public_url": target.public_url, "content_type": content_type, "bytes": size }))
-    }
-
-    #[tool(
-        description = "Show this server's spending safeguards and the estimated spend recorded today (UTC, since the server last restarted).",
-        annotations(read_only_hint = true, open_world_hint = false)
-    )]
-    async fn get_spend_limits(&self) -> Result<String, String> {
-        to_json(json!({
-            "max_usd_per_request": self.guard.max_usd_per_request,
-            "max_usd_per_day": self.guard.max_usd_per_day,
-            "estimated_spend_today_usd": self.guard.spent_today().await,
-            "allow_unestimated": self.allow_unestimated,
-            "note": "Authoritative balance and usage: https://cloud.higgsfield.ai",
-        }))
     }
 }
 
@@ -567,18 +497,6 @@ fn sniff_type(b: &[u8]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn spend_guard_enforces_caps() {
-        let g = SpendGuard::new(2.0, Some(3.0));
-        assert!(g.reserve(1.5, 1.0).await.is_err(), "over caller max");
-        assert!(g.reserve(2.5, 10.0).await.is_err(), "over per-request cap");
-        assert!(g.reserve(1.5, 2.0).await.is_ok());
-        assert!(g.reserve(1.5, 2.0).await.is_ok());
-        assert!(g.reserve(0.5, 2.0).await.is_err(), "over daily cap");
-        g.release(1.5).await;
-        assert!(g.reserve(0.5, 2.0).await.is_ok());
-    }
 
     #[test]
     fn collects_output_urls() {

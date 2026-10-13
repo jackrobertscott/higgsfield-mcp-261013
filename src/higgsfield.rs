@@ -24,16 +24,6 @@ pub struct Estimate {
     pub usd: Value,
 }
 
-impl Estimate {
-    pub fn usd_f64(&self) -> Result<f64> {
-        match &self.usd {
-            Value::String(s) => s.parse().with_context(|| format!("bad usd value {s:?}")),
-            Value::Number(n) => n.as_f64().ok_or_else(|| anyhow!("bad usd value {n}")),
-            other => bail!("unexpected usd value {other}"),
-        }
-    }
-}
-
 #[derive(Debug, Deserialize)]
 pub struct UploadTarget {
     pub public_url: String,
@@ -42,16 +32,69 @@ pub struct UploadTarget {
     pub upload_headers: serde_json::Map<String, Value>,
 }
 
-impl HiggsfieldClient {
+/// A caller's Higgsfield API key. Never logged or stored.
+#[derive(Clone)]
+pub struct Credentials {
+    key_id: String,
+    key_secret: String,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Credentials(<redacted>)")
+    }
+}
+
+impl Credentials {
     pub fn new(key_id: &str, key_secret: &str) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("higgsfield-mcp/", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(60))
-            .build()?;
-        Ok(Self {
+        let (key_id, key_secret) = (key_id.trim(), key_secret.trim());
+        if key_id.is_empty() || key_secret.is_empty() {
+            bail!("Higgsfield key id and secret must both be non-empty");
+        }
+        let ok = |s: &str| s.chars().all(|c| c.is_ascii_graphic());
+        if !ok(key_id) || !ok(key_secret) || key_id.contains(':') {
+            bail!("Higgsfield key id/secret contain invalid characters");
+        }
+        Ok(Self { key_id: key_id.into(), key_secret: key_secret.into() })
+    }
+
+    /// Accepts `Authorization: Key ID:SECRET` (Higgsfield's own format) or
+    /// `Authorization: Bearer ID:SECRET`, or the `X-Higgsfield-Key-Id` and
+    /// `X-Higgsfield-Key-Secret` header pair. Returns `None` when absent.
+    pub fn from_headers(headers: &http::HeaderMap) -> Result<Option<Self>> {
+        let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
+        if let (Some(id), Some(secret)) = (get("x-higgsfield-key-id"), get("x-higgsfield-key-secret")) {
+            return Self::new(id, secret).map(Some);
+        }
+        let Some(auth) = get("authorization") else {
+            return Ok(None);
+        };
+        let (scheme, value) = auth.split_once(' ').unwrap_or(("", auth));
+        if !matches!(scheme.to_ascii_lowercase().as_str(), "key" | "bearer") {
+            bail!("unsupported Authorization scheme; use `Authorization: Key <KEY_ID>:<KEY_SECRET>`");
+        }
+        let (id, secret) = value
+            .trim()
+            .split_once(':')
+            .ok_or_else(|| anyhow!("Authorization must be `Key <KEY_ID>:<KEY_SECRET>` (id and secret joined by a colon)"))?;
+        Self::new(id, secret).map(Some)
+    }
+}
+
+pub fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(concat!("higgsfield-mcp/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(60))
+        .build()
+        .expect("reqwest client builds with static config")
+}
+
+impl HiggsfieldClient {
+    pub fn new(http: reqwest::Client, creds: Credentials) -> Self {
+        Self {
             http,
-            auth_header: format!("Key {key_id}:{key_secret}"),
-        })
+            auth_header: format!("Key {}:{}", creds.key_id, creds.key_secret),
+        }
     }
 
     async fn send(
@@ -228,5 +271,30 @@ fn explain_status(status: StatusCode) -> &'static str {
         503 => "model disabled or not ready, try later",
         s if s >= 500 => "Higgsfield server error",
         _ => "error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn parses_caller_credentials() {
+        let c = Credentials::from_headers(&headers(&[("authorization", "Key abc:s3cr:et")])).unwrap().unwrap();
+        assert_eq!((c.key_id.as_str(), c.key_secret.as_str()), ("abc", "s3cr:et"));
+        assert!(Credentials::from_headers(&headers(&[("authorization", "Bearer abc:xyz")])).unwrap().is_some());
+        assert!(Credentials::from_headers(&headers(&[("x-higgsfield-key-id", "a"), ("x-higgsfield-key-secret", "b")])).unwrap().is_some());
+        assert!(Credentials::from_headers(&headers(&[])).unwrap().is_none());
+        assert!(Credentials::from_headers(&headers(&[("authorization", "Key nocolon")])).is_err());
+        assert!(Credentials::from_headers(&headers(&[("authorization", "Basic abc:xyz")])).is_err());
+        assert_eq!(format!("{c:?}"), "Credentials(<redacted>)");
     }
 }
