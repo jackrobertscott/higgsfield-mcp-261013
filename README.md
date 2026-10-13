@@ -76,7 +76,7 @@ and use the full path to the binary:
 | Variable | Default | Notes |
 | - | - | - |
 | `HF_API_KEY_ID` / `HF_API_KEY_SECRET` | | Your Higgsfield API key |
-| `HF_OUTPUT_DIR` | `~/Downloads/higgsfield` | Where `download_output` saves files when no `dir` is given |
+| `HF_OUTPUT_DIR` | `~/Documents/Higgsfield` | Where `download_output` saves files when no `dir` is given |
 | `RUST_LOG` | `info` | Log filter. Logs go to stderr |
 
 ## Development

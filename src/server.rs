@@ -116,7 +116,7 @@ pub struct UploadArgs {
 pub struct DownloadArgs {
     /// Output URL from get_request_status or wait_for_request.
     pub url: String,
-    /// Directory to save into. Defaults to HF_OUTPUT_DIR, or ~/Downloads/higgsfield.
+    /// Directory to save into. Defaults to HF_OUTPUT_DIR, or ~/Documents/Higgsfield.
     pub dir: Option<String>,
     /// File name to save as. Defaults to the last segment of the URL; never overwrites an existing file.
     pub filename: Option<String>,
@@ -419,7 +419,7 @@ fn default_output_dir() -> Result<PathBuf> {
         return Ok(expand_home(&dir));
     }
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set; pass dir explicitly"))?;
-    Ok(PathBuf::from(home).join("Downloads").join("higgsfield"))
+    Ok(PathBuf::from(home).join("Documents").join("Higgsfield"))
 }
 
 async fn read_local(path: &str) -> Result<(Vec<u8>, Option<String>)> {

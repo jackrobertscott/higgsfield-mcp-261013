@@ -15,7 +15,7 @@ Run it from an MCP client (Claude Code, Claude Desktop); it speaks MCP over stdi
 
 Environment:
   HF_API_KEY_ID, HF_API_KEY_SECRET  Higgsfield API key from https://cloud.higgsfield.ai
-  HF_OUTPUT_DIR                     Where download_output saves files (default ~/Downloads/higgsfield)
+  HF_OUTPUT_DIR                     Where download_output saves files (default ~/Documents/Higgsfield)
   RUST_LOG                          Log filter, written to stderr (default info)";
 
 fn env_opt(name: &str) -> Option<String> {
